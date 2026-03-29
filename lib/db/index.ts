@@ -6,16 +6,43 @@ import { Pool } from 'pg';
  * Prefer pooled Neon URL for serverless.
  */
 function getConnectionString(): string {
-  const url =
-    process.env['DATABASE_URL'] ??
-    process.env['POSTGRES_URL'] ??
-    process.env['POSTGRES_PRISMA_URL'];
-  if (!url || typeof url !== 'string' || url.trim() === '') {
-    throw new Error(
-      'Missing DATABASE_URL (or POSTGRES_URL). Set it in Vercel → Environment Variables for Production, then redeploy.'
-    );
+  const url = pickDatabaseUrl();
+  return normalizeConnectionString(url);
+}
+
+/** First non-empty wins. `??` alone is wrong here: `"" ?? postgresql://...` keeps "". */
+function pickDatabaseUrl(): string {
+  const keys = ['DATABASE_URL', 'POSTGRES_URL', 'POSTGRES_PRISMA_URL'] as const;
+  for (const key of keys) {
+    const v = process.env[key];
+    if (typeof v === 'string' && v.trim() !== '') {
+      return v.trim();
+    }
   }
-  return url.trim();
+  throw new Error(
+    'Missing DATABASE_URL (or POSTGRES_URL). Set it in Vercel → Environment Variables for Production, then redeploy.'
+  );
+}
+
+/**
+ * pg v8 warns when sslmode=require is parsed as verify-full; pg v9 will match libpq.
+ * Opt into libpq-compatible SSL for connection-string parsing (see pg-connection-string).
+ */
+function normalizeConnectionString(url: string): string {
+  let out = url;
+
+  if (!/\buselibpqcompat=/.test(out) && /\bsslmode=(require|prefer|verify-ca)\b/.test(out)) {
+    const sep = out.includes('?') ? '&' : '?';
+    out = `${out}${sep}uselibpqcompat=true`;
+  }
+
+  // Unqualified names (users, teams) must hit public.* — Neon default search_path can omit public.
+  if (!/[?&]options=/.test(out) && !/search_path%3Dpublic/.test(out)) {
+    const sep = out.includes('?') ? '&' : '?';
+    out = `${out}${sep}options=-c%20search_path%3Dpublic`;
+  }
+
+  return out;
 }
 
 let _pool: Pool | undefined;
