@@ -1,16 +1,12 @@
-import { Pool } from 'pg';
+import { Pool, type PoolConfig } from 'pg';
+import pgConnectionString from 'pg-connection-string';
 
 /**
- * Read env at first use (not at module load) so Vercel/runtime sees DATABASE_URL.
- * Bracket access avoids some bundlers inlining undefined at build time.
- * Prefer pooled Neon URL for serverless.
+ * Vercel often sets PGHOST, PGDATABASE, PGUSER, etc. The `pg` client merges those with
+ * parsed URLs; a bad PG* value can override the URL and connect to the wrong database
+ * (empty DB → "relation does not exist" for every table). We parse the URL and build
+ * an explicit PoolConfig so only the URL you intend is used.
  */
-function getConnectionString(): string {
-  const url = pickDatabaseUrl();
-  return normalizeConnectionString(url);
-}
-
-/** First non-empty wins. `??` alone is wrong here: `"" ?? postgresql://...` keeps "". */
 function pickDatabaseUrl(): string {
   const keys = ['DATABASE_URL', 'POSTGRES_URL', 'POSTGRES_PRISMA_URL'] as const;
   for (const key of keys) {
@@ -24,39 +20,40 @@ function pickDatabaseUrl(): string {
   );
 }
 
-/**
- * pg v8 warns when sslmode=require is parsed as verify-full; pg v9 will match libpq.
- * Opt into libpq-compatible SSL for connection-string parsing (see pg-connection-string).
- */
-function normalizeConnectionString(url: string): string {
-  let out = url;
-
-  if (!/\buselibpqcompat=/.test(out) && /\bsslmode=(require|prefer|verify-ca)\b/.test(out)) {
-    const sep = out.includes('?') ? '&' : '?';
-    out = `${out}${sep}uselibpqcompat=true`;
+function createPool(): Pool {
+  const raw = pickDatabaseUrl();
+  const parsed = pgConnectionString.parse(raw, { useLibpqCompat: true });
+  if (!parsed.host) {
+    throw new Error('Invalid DATABASE_URL: missing host');
   }
+  const clientConfig = pgConnectionString.toClientConfig(parsed) as PoolConfig;
 
-  // Unqualified names (users, teams) must hit public.* — Neon default search_path can omit public.
-  if (!/[?&]options=/.test(out) && !/search_path%3Dpublic/.test(out)) {
-    const sep = out.includes('?') ? '&' : '?';
-    out = `${out}${sep}options=-c%20search_path%3Dpublic`;
-  }
+  const database =
+    (typeof clientConfig.database === 'string' && clientConfig.database.trim() !== ''
+      ? clientConfig.database
+      : parsed.database) || 'neondb';
 
-  return out;
+  return new Pool({
+    ...clientConfig,
+    host: clientConfig.host ?? parsed.host ?? undefined,
+    user: clientConfig.user ?? parsed.user ?? undefined,
+    password: clientConfig.password ?? parsed.password,
+    database,
+    // Force public schema; unqualified SQL (FROM users) must resolve correctly
+    options: '-c search_path=public',
+    ssl: clientConfig.ssl ?? { rejectUnauthorized: false },
+    max: 5,
+    idleTimeoutMillis: 20000,
+    connectionTimeoutMillis: 15000,
+    application_name: 'custom-sports-bets',
+  });
 }
 
 let _pool: Pool | undefined;
 
 function getPool(): Pool {
   if (!_pool) {
-    _pool = new Pool({
-      connectionString: getConnectionString(),
-      // Serverless: keep pool small; Neon pooler handles multiplexing
-      max: 5,
-      idleTimeoutMillis: 20000,
-      connectionTimeoutMillis: 15000,
-      ssl: { rejectUnauthorized: false },
-    });
+    _pool = createPool();
     _pool.on('connect', () => {
       console.log('Connected to Neon database');
     });
@@ -67,16 +64,12 @@ function getPool(): Pool {
   return _pool;
 }
 
-/** Lazy Pool — first query reads env at runtime (important on Vercel). */
-const pool = new Proxy({} as Pool, {
-  get(_target, prop) {
-    const real = getPool();
-    const value = (real as unknown as Record<PropertyKey, unknown>)[prop];
-    if (typeof value === 'function') {
-      return (value as (...a: unknown[]) => unknown).bind(real);
-    }
-    return value;
-  },
-});
+/**
+ * Only `query` is used across the app — explicit delegate avoids Proxy edge cases with `pg`.
+ */
+const pool = {
+  query: ((...args: Parameters<Pool['query']>) =>
+    getPool().query(...args)) as Pool['query'],
+} as Pool;
 
 export default pool;
