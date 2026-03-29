@@ -27,20 +27,23 @@ function createPool(): Pool {
     throw new Error('Invalid DATABASE_URL: missing host');
   }
   const clientConfig = pgConnectionString.toClientConfig(parsed) as PoolConfig;
+  // Neon pooler (PgBouncer) rejects startup `options` (e.g. search_path). Do not set Pool `options`.
+  // https://neon.tech/docs/connect/connection-errors#unsupported-startup-parameter
+  const { options: _discardOptions, ...restClientConfig } = clientConfig;
 
   const database =
     (typeof clientConfig.database === 'string' && clientConfig.database.trim() !== ''
       ? clientConfig.database
       : parsed.database) || 'neondb';
 
+  void _discardOptions;
+
   return new Pool({
-    ...clientConfig,
+    ...restClientConfig,
     host: clientConfig.host ?? parsed.host ?? undefined,
     user: clientConfig.user ?? parsed.user ?? undefined,
     password: clientConfig.password ?? parsed.password,
     database,
-    // Force public schema; unqualified SQL (FROM users) must resolve correctly
-    options: '-c search_path=public',
     ssl: clientConfig.ssl ?? { rejectUnauthorized: false },
     max: 5,
     idleTimeoutMillis: 20000,
